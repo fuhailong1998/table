@@ -4,10 +4,6 @@ firmware/src/secrets.h
 # PlatformIO build artifacts
 firmware/.pio/
 
-# Server virtualenv and env
-server/venv/
-server/.env
-
 # IDE
 .vscode/
 .idea/
