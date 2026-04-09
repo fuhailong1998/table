@@ -52,6 +52,12 @@
 #define CURSOR_FETCH_INTERVAL     300000   // Cursor: 5 分钟
 #define FULL_REFRESH_INTERVAL     1800000  // 全刷新: 30 分钟
 
+// --- LD2402 雷达传感器 (UART) ---
+#define RADAR_TX_PIN  4     // LD2402 TX → ESP32 RX
+#define RADAR_RX_PIN  5     // LD2402 RX → ESP32 TX
+#define RADAR_BAUD    115200
+#define RADAR_AWAY_MS 60000    // 无人切换时钟画面: 1 分钟
+
 // --- 屏幕配置 ---
 #define EPD_WIDTH    648
 #define EPD_HEIGHT   480

@@ -103,6 +103,18 @@ struct GoldData {
     bool valid;
 } goldData = {};
 
+struct RadarData {
+    uint8_t status;        // 0=无人, 1=运动, 2=静止
+    float   distanceCm;    // 距离(cm)
+    bool    present;       // 是否有人
+    unsigned long lastSeen;       // 上次检测到人的时间
+    unsigned long todayOccupied;  // 今日在座累计毫秒
+    int           lastResetDay;   // 上次重置统计的日期
+    bool    awayMode;      // 是否进入了离开模式(简洁时钟)
+} radarData = {};
+
+HardwareSerial radarSerial(1);
+
 // ============================================================
 // 定时器
 // ============================================================
@@ -116,7 +128,97 @@ unsigned long lastWeatherFetch = 0;
 unsigned long lastFgFetch      = 0;
 unsigned long lastAqiFetch     = 0;
 unsigned long lastFullRefresh  = 0;
+unsigned long lastOccupiedTick = 0;
 bool wifiConnected = false;
+
+// ============================================================
+// LD2402 雷达
+// ============================================================
+
+// LD2402 使用 ASCII 串口协议，格式：
+// "ON\r\n"        = 有人
+// "OFF\r\n"       = 无人
+// "distance:XXX\r\n" = 距离(cm)
+
+static char radarLine[64];
+static int radarLineIdx = 0;
+static unsigned long lastRadarDebug = 0;
+static unsigned long radarBytesTotal = 0;
+
+void processRadarLine(const char *line)
+{
+    bool wasPresent = radarData.present;
+
+    if (strncmp(line, "ON", 2) == 0) {
+        radarData.present = true;
+        radarData.status = 1;
+        radarData.lastSeen = millis();
+        if (!wasPresent) Serial.println("Radar: person detected");
+    } else if (strncmp(line, "OFF", 3) == 0) {
+        radarData.present = false;
+        radarData.status = 0;
+        if (wasPresent) Serial.println("Radar: person left");
+    } else if (strncmp(line, "distance:", 9) == 0) {
+        int d = atoi(line + 9);
+        if (d > 0) {
+            radarData.distanceCm = d;
+            radarData.present = true;
+            radarData.status = 2;
+            radarData.lastSeen = millis();
+            if (!wasPresent) {
+                Serial.printf("Radar: person at %dcm\n", d);
+            }
+        }
+    }
+}
+
+void pollRadar()
+{
+    while (radarSerial.available()) {
+        char c = (char)radarSerial.read();
+        radarBytesTotal++;
+
+        if (c == '\n' || c == '\r') {
+            if (radarLineIdx > 0) {
+                radarLine[radarLineIdx] = '\0';
+                processRadarLine(radarLine);
+                radarLineIdx = 0;
+            }
+        } else {
+            if (radarLineIdx < (int)sizeof(radarLine) - 1) {
+                radarLine[radarLineIdx++] = c;
+            }
+        }
+    }
+}
+
+void updateOccupancy()
+{
+    unsigned long now = millis();
+
+    // 每日零点重置统计
+    if (timeData.valid && timeData.day != radarData.lastResetDay) {
+        radarData.todayOccupied = 0;
+        radarData.lastResetDay = timeData.day;
+        Serial.printf("Occupancy reset for day %d\n", timeData.day);
+    }
+
+    // 累加在座时间
+    if (radarData.present && lastOccupiedTick > 0) {
+        radarData.todayOccupied += (now - lastOccupiedTick);
+    }
+    lastOccupiedTick = radarData.present ? now : 0;
+
+    // 判断是否进入离开模式
+    bool wasAway = radarData.awayMode;
+    radarData.awayMode = !radarData.present &&
+                         radarData.lastSeen > 0 &&
+                         (now - radarData.lastSeen > RADAR_AWAY_MS);
+
+    if (radarData.awayMode != wasAway) {
+        Serial.printf("Away mode: %s\n", radarData.awayMode ? "ON" : "OFF");
+    }
+}
 
 // ============================================================
 // WiFi
@@ -278,29 +380,8 @@ void fetchCryptoPrices()
     WiFiClientSecure client;
     client.setInsecure();
 
-    // --- 方案1: OKX ---
-    Serial.println("Fetching crypto prices (OKX)...");
-    OKXResult btc  = fetchOKXPrice(client, "BTC-USDT");
-    OKXResult eth  = fetchOKXPrice(client, "ETH-USDT");
-    OKXResult sol  = fetchOKXPrice(client, "SOL-USDT");
-    OKXResult doge = fetchOKXPrice(client, "DOGE-USDT");
-
-    if (btc.price > 0) {
-        cryptoData.btc = btc.price;   cryptoData.btcPct  = btc.pct24h;
-        cryptoData.eth = eth.price;   cryptoData.ethPct  = eth.pct24h;
-        cryptoData.sol = sol.price;   cryptoData.solPct  = sol.pct24h;
-        cryptoData.doge = doge.price; cryptoData.dogePct = doge.pct24h;
-        cryptoData.valid = true;
-        Serial.printf("Crypto (OKX): BTC=$%.0f(%+.1f%%)  ETH=$%.1f(%+.1f%%)  SOL=$%.2f(%+.1f%%)  DOGE=$%.4f(%+.1f%%)\n",
-                      cryptoData.btc, cryptoData.btcPct,
-                      cryptoData.eth, cryptoData.ethPct,
-                      cryptoData.sol, cryptoData.solPct,
-                      cryptoData.doge, cryptoData.dogePct);
-        return;
-    }
-
-    // --- 方案2: CryptoCompare (单次请求获取全部) ---
-    Serial.println("OKX failed, trying CryptoCompare...");
+    // --- 方案1: CryptoCompare (单次请求获取全部) ---
+    Serial.println("Fetching crypto (CryptoCompare)...");
     {
         HTTPClient http;
         http.begin(client, "https://min-api.cryptocompare.com/data/pricemultifull?fsyms=BTC,ETH,SOL,DOGE&tsyms=USD");
@@ -335,7 +416,7 @@ void fetchCryptoPrices()
         if (cryptoData.valid) return;
     }
 
-    // --- 方案3: Binance ---
+    // --- 方案2: Binance ---
     Serial.println("CryptoCompare failed, trying Binance...");
     float bp, bpct;
     if (fetchBinanceTicker(client, "BTCUSDT", bp, bpct)) {
@@ -352,7 +433,7 @@ void fetchCryptoPrices()
         return;
     }
 
-    // --- 方案4: CoinGecko ---
+    // --- 方案3: CoinGecko ---
     Serial.println("Binance failed, trying CoinGecko...");
     {
         HTTPClient http;
@@ -1135,12 +1216,21 @@ void drawFooter()
     display.setCursor(L::W / 2 - tw / 2, textY);
     display.print(buf);
 
-    // Uptime (右侧)
-    unsigned long sec = millis() / 1000;
-    snprintf(buf, sizeof(buf), "Up %luh%lum", sec / 3600, (sec % 3600) / 60);
-    display.getTextBounds(buf, 0, 0, &tx, &ty, &tw, &th);
-    display.setCursor(L::W - tw - 14, textY);
-    display.print(buf);
+    // 雷达状态 + 距离 + 工位时间 (右侧)
+    {
+        unsigned long secs = radarData.todayOccupied / 1000;
+        int oh = secs / 3600, om = (secs % 3600) / 60;
+        if (radarData.present) {
+            const char* rstat = (radarData.status == 2) ? "Sit" : "Mov";
+            snprintf(buf, sizeof(buf), "%s %.1fm %dh%dm",
+                     rstat, radarData.distanceCm / 100.0f, oh, om);
+        } else {
+            snprintf(buf, sizeof(buf), "Away %dh%dm", oh, om);
+        }
+        display.getTextBounds(buf, 0, 0, &tx, &ty, &tw, &th);
+        display.setCursor(L::W - tw - 14, textY);
+        display.print(buf);
+    }
 }
 
 // ============================================================
@@ -1226,7 +1316,10 @@ void setup()
 {
     Serial.begin(115200);
     delay(1000);
-    Serial.println("\n=== E-Paper Desktop Monitor - Phase 5 ===");
+    Serial.println("\n=== E-Paper Desktop Monitor - Phase 6 ===");
+
+    radarSerial.begin(RADAR_BAUD, SERIAL_8N1, RADAR_TX_PIN, RADAR_RX_PIN);
+    Serial.println("LD2402 radar UART OK");
 
     SPI.begin(EPD_SCLK, -1, EPD_MOSI, EPD_CS);
     Wire.begin(BME_SDA, BME_SCL);
@@ -1268,12 +1361,85 @@ void setup()
     lastAqiFetch     = t;
     lastCursorFetch  = t;
 
-    Serial.println("Phase 5 ready.");
+    Serial.println("Phase 6 ready.");
+}
+
+void drawClockScreen()
+{
+    display.setRotation(EPD_ROTATION);
+    display.setFullWindow();
+    display.firstPage();
+    do {
+        display.fillScreen(GxEPD_WHITE);
+
+        char buf[32];
+        updateTimeData();
+
+        // 大字时钟居中
+        display.setFont(&FreeSansBold24pt7b);
+        snprintf(buf, sizeof(buf), "%02d:%02d", timeData.hour, timeData.minute);
+        int16_t tx, ty; uint16_t tw, th;
+        display.getTextBounds(buf, 0, 0, &tx, &ty, &tw, &th);
+        display.setCursor((L::W - tw) / 2 - tx, L::H / 2 - 20);
+        display.print(buf);
+
+        // 日期
+        static const char* weekNames[] = {"日","一","二","三","四","五","六"};
+        display.setFont(&FreeSans12pt7b);
+        snprintf(buf, sizeof(buf), "%04d-%02d-%02d  %s",
+                 timeData.year, timeData.month, timeData.day,
+                 weekNames[timeData.weekday % 7]);
+        display.getTextBounds(buf, 0, 0, &tx, &ty, &tw, &th);
+        display.setCursor((L::W - tw) / 2 - tx, L::H / 2 + 30);
+        display.print(buf);
+
+        // 温度
+        if (sensorData.valid) {
+            snprintf(buf, sizeof(buf), "%.1fC  %.0f%%", sensorData.temperature, sensorData.humidity);
+            display.getTextBounds(buf, 0, 0, &tx, &ty, &tw, &th);
+            display.setCursor((L::W - tw) / 2 - tx, L::H / 2 + 70);
+            display.print(buf);
+        }
+
+        // 今日在座
+        unsigned long secs = radarData.todayOccupied / 1000;
+        int oh = secs / 3600, om = (secs % 3600) / 60;
+        display.setFont(&FreeSans9pt7b);
+        snprintf(buf, sizeof(buf), "Today %dh%dm", oh, om);
+        display.getTextBounds(buf, 0, 0, &tx, &ty, &tw, &th);
+        display.setCursor((L::W - tw) / 2 - tx, L::H - 20);
+        display.print(buf);
+    } while (display.nextPage());
 }
 
 void loop()
 {
     unsigned long now = millis();
+
+    pollRadar();
+    updateOccupancy();
+
+    bool wasAway = radarData.awayMode;
+
+    // 从离开模式回到正常模式 → 全刷
+    if (wasAway && !radarData.awayMode) {
+        // 刚回来，恢复完整画面
+    }
+
+    // 离开模式：只显示简洁时钟，降低刷新频率
+    if (radarData.awayMode) {
+        if (now - lastTimeRefresh >= 60000) {
+            updateTimeData();
+            readSensor();
+            display.init(115200, false, 50, false);
+            drawClockScreen();
+            lastTimeRefresh = now;
+        }
+        delay(1000);
+        return;
+    }
+
+    // === 正常模式 ===
 
     // 每分钟：刷新时间 + Footer
     if (now - lastTimeRefresh >= 60000) {
@@ -1304,7 +1470,7 @@ void loop()
     // 每 10 分钟：获取汇率 + 金价
     if (now - lastFxFetch >= EXCHANGE_FETCH_INTERVAL) {
         ensureWiFi();
-        goldData.valid = false;  // 强制刷新金价
+        goldData.valid = false;
         fetchExchangeRate();
         fetchGoldPrice();
         display.init(115200, false, 50, false);
