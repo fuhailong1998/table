@@ -134,11 +134,14 @@ void connectWiFi()
     if (wifiConnected) {
         Serial.printf("\nWiFi connected! IP: %s\n", WiFi.localIP().toString().c_str());
 
-        // 覆盖 DNS 为 Google/Cloudflare，绕过路由器 DNS 封锁
-        IPAddress dns1(8, 8, 8, 8);
-        IPAddress dns2(1, 1, 1, 1);
+#ifdef CUSTOM_DNS1
+        IPAddress dns1 CUSTOM_DNS1;
+        IPAddress dns2 CUSTOM_DNS2;
         WiFi.config(WiFi.localIP(), WiFi.gatewayIP(), WiFi.subnetMask(), dns1, dns2);
-        Serial.printf("DNS overridden to 8.8.8.8 / 1.1.1.1\n");
+        Serial.printf("DNS overridden to %s / %s\n", dns1.toString().c_str(), dns2.toString().c_str());
+#else
+        Serial.printf("Using default DNS: %s\n", WiFi.dnsIP().toString().c_str());
+#endif
     } else {
         Serial.println("\nWiFi FAILED!");
     }
@@ -242,6 +245,32 @@ OKXResult fetchOKXPrice(WiFiClientSecure &client, const char* instId)
     return r;
 }
 
+bool fetchBinanceTicker(WiFiClientSecure &client, const char* symbol,
+                        float &outPrice, float &outPct)
+{
+    HTTPClient http;
+    char url[128];
+    snprintf(url, sizeof(url),
+             "https://api.binance.com/api/v3/ticker/24hr?symbol=%s", symbol);
+    http.begin(client, url);
+    http.setTimeout(10000);
+    int code = http.GET();
+    bool ok = false;
+    if (code == 200) {
+        String payload = http.getString();
+        JsonDocument doc;
+        if (!deserializeJson(doc, payload)) {
+            outPrice = doc["lastPrice"].as<float>();
+            outPct   = doc["priceChangePercent"].as<float>();
+            ok = (outPrice > 0);
+        }
+    } else {
+        Serial.printf("  Binance %s failed: %d\n", symbol, code);
+    }
+    http.end();
+    return ok;
+}
+
 void fetchCryptoPrices()
 {
     if (!wifiConnected) return;
@@ -249,8 +278,8 @@ void fetchCryptoPrices()
     WiFiClientSecure client;
     client.setInsecure();
 
+    // --- 方案1: OKX ---
     Serial.println("Fetching crypto prices (OKX)...");
-
     OKXResult btc  = fetchOKXPrice(client, "BTC-USDT");
     OKXResult eth  = fetchOKXPrice(client, "ETH-USDT");
     OKXResult sol  = fetchOKXPrice(client, "SOL-USDT");
@@ -262,14 +291,70 @@ void fetchCryptoPrices()
         cryptoData.sol = sol.price;   cryptoData.solPct  = sol.pct24h;
         cryptoData.doge = doge.price; cryptoData.dogePct = doge.pct24h;
         cryptoData.valid = true;
-        Serial.printf("Crypto: BTC=$%.0f(%+.1f%%)  ETH=$%.1f(%+.1f%%)  SOL=$%.2f(%+.1f%%)  DOGE=$%.4f(%+.1f%%)\n",
+        Serial.printf("Crypto (OKX): BTC=$%.0f(%+.1f%%)  ETH=$%.1f(%+.1f%%)  SOL=$%.2f(%+.1f%%)  DOGE=$%.4f(%+.1f%%)\n",
                       cryptoData.btc, cryptoData.btcPct,
                       cryptoData.eth, cryptoData.ethPct,
                       cryptoData.sol, cryptoData.solPct,
                       cryptoData.doge, cryptoData.dogePct);
-    } else {
-        Serial.println("Crypto fetch failed from OKX, trying CoinGecko...");
+        return;
+    }
 
+    // --- 方案2: CryptoCompare (单次请求获取全部) ---
+    Serial.println("OKX failed, trying CryptoCompare...");
+    {
+        HTTPClient http;
+        http.begin(client, "https://min-api.cryptocompare.com/data/pricemultifull?fsyms=BTC,ETH,SOL,DOGE&tsyms=USD");
+        http.setTimeout(10000);
+        int code = http.GET();
+        if (code == 200) {
+            String payload = http.getString();
+            JsonDocument doc;
+            if (!deserializeJson(doc, payload)) {
+                JsonObject raw = doc["RAW"];
+                cryptoData.btc     = raw["BTC"]["USD"]["PRICE"].as<float>();
+                cryptoData.btcPct  = raw["BTC"]["USD"]["CHANGEPCT24HOUR"].as<float>();
+                cryptoData.eth     = raw["ETH"]["USD"]["PRICE"].as<float>();
+                cryptoData.ethPct  = raw["ETH"]["USD"]["CHANGEPCT24HOUR"].as<float>();
+                cryptoData.sol     = raw["SOL"]["USD"]["PRICE"].as<float>();
+                cryptoData.solPct  = raw["SOL"]["USD"]["CHANGEPCT24HOUR"].as<float>();
+                cryptoData.doge    = raw["DOGE"]["USD"]["PRICE"].as<float>();
+                cryptoData.dogePct = raw["DOGE"]["USD"]["CHANGEPCT24HOUR"].as<float>();
+                if (cryptoData.btc > 0) {
+                    cryptoData.valid = true;
+                    Serial.printf("Crypto (CryptoCompare): BTC=$%.0f(%+.1f%%)  ETH=$%.1f(%+.1f%%)  SOL=$%.2f(%+.1f%%)  DOGE=$%.4f(%+.1f%%)\n",
+                                  cryptoData.btc, cryptoData.btcPct,
+                                  cryptoData.eth, cryptoData.ethPct,
+                                  cryptoData.sol, cryptoData.solPct,
+                                  cryptoData.doge, cryptoData.dogePct);
+                }
+            }
+        } else {
+            Serial.printf("CryptoCompare failed: %d\n", code);
+        }
+        http.end();
+        if (cryptoData.valid) return;
+    }
+
+    // --- 方案3: Binance ---
+    Serial.println("CryptoCompare failed, trying Binance...");
+    float bp, bpct;
+    if (fetchBinanceTicker(client, "BTCUSDT", bp, bpct)) {
+        cryptoData.btc = bp; cryptoData.btcPct = bpct;
+        fetchBinanceTicker(client, "ETHUSDT",  cryptoData.eth,  cryptoData.ethPct);
+        fetchBinanceTicker(client, "SOLUSDT",  cryptoData.sol,  cryptoData.solPct);
+        fetchBinanceTicker(client, "DOGEUSDT", cryptoData.doge, cryptoData.dogePct);
+        cryptoData.valid = true;
+        Serial.printf("Crypto (Binance): BTC=$%.0f(%+.1f%%)  ETH=$%.1f(%+.1f%%)  SOL=$%.2f(%+.1f%%)  DOGE=$%.4f(%+.1f%%)\n",
+                      cryptoData.btc, cryptoData.btcPct,
+                      cryptoData.eth, cryptoData.ethPct,
+                      cryptoData.sol, cryptoData.solPct,
+                      cryptoData.doge, cryptoData.dogePct);
+        return;
+    }
+
+    // --- 方案4: CoinGecko ---
+    Serial.println("Binance failed, trying CoinGecko...");
+    {
         HTTPClient http;
         http.begin(client, "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana,dogecoin&vs_currencies=usd");
         http.setTimeout(10000);
@@ -291,6 +376,8 @@ void fetchCryptoPrices()
         }
         http.end();
     }
+
+    if (!cryptoData.valid) Serial.println("Crypto: all sources failed!");
 }
 
 // ============================================================
@@ -1062,7 +1149,7 @@ void drawFooter()
 
 void drawFullScreen()
 {
-    display.setRotation(0);
+    display.setRotation(EPD_ROTATION);
     display.setFullWindow();
     display.firstPage();
     do {

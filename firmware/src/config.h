@@ -20,9 +20,13 @@
 #define BME_ADDR  0x76  // SDO 接 GND 时地址为 0x76
 
 // --- NTP 配置 ---
-#define NTP_SERVER    "192.168.100.1"
+#define NTP_SERVER    "192.168.6.1"
 #define GMT_OFFSET    8 * 3600      // UTC+8
 #define DST_OFFSET    0
+
+// --- DNS 覆盖（注释掉则使用路由器默认 DNS）---
+#define CUSTOM_DNS1 (223, 5, 5, 5)
+#define CUSTOM_DNS2 (119, 29, 29, 29)
 
 // --- API 端点 ---
 #define EXCHANGE_API  "https://open.er-api.com/v6/latest/USD"
@@ -48,6 +52,7 @@
 #define CURSOR_FETCH_INTERVAL     300000   // Cursor: 5 分钟
 #define FULL_REFRESH_INTERVAL     1800000  // 全刷新: 30 分钟
 
-// --- 屏幕尺寸 ---
-#define EPD_WIDTH   648
-#define EPD_HEIGHT  480
+// --- 屏幕配置 ---
+#define EPD_WIDTH    648
+#define EPD_HEIGHT   480
+#define EPD_ROTATION 2      // 0=默认, 2=翻转180度
