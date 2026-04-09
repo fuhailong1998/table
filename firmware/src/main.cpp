@@ -103,6 +103,22 @@ struct GoldData {
     bool valid;
 } goldData = {};
 
+struct IndexItem {
+    char   name[8];     // "SPX", "NDQ", "DJI", "SHC"
+    float  price;
+    float  pctChange;   // daily change %
+    bool   valid;
+};
+
+struct IndexData {
+    IndexItem items[4];
+    bool valid;
+} indexData = {
+    {{"SPX", 0, 0, false}, {"NDQ", 0, 0, false},
+     {"DJI", 0, 0, false}, {"SHC", 0, 0, false}},
+    false
+};
+
 struct RadarData {
     uint8_t status;        // 0=无人, 1=运动, 2=静止
     float   distanceCm;    // 距离(cm)
@@ -127,6 +143,7 @@ unsigned long lastCursorFetch  = 0;
 unsigned long lastWeatherFetch = 0;
 unsigned long lastFgFetch      = 0;
 unsigned long lastAqiFetch     = 0;
+unsigned long lastIndexFetch   = 0;
 unsigned long lastFullRefresh  = 0;
 unsigned long lastOccupiedTick = 0;
 bool wifiConnected = false;
@@ -505,29 +522,6 @@ void fetchExchangeRate()
     }
     http.end();
 
-    // 获取 USD/CNY 24h 变化 (Yahoo Finance)
-    if (fxData.valid && !fxData.hasPct) {
-        Serial.println("Fetching USD/CNY 24h change...");
-        http.begin(client, "https://query1.finance.yahoo.com/v8/finance/chart/USDCNY=X?interval=1d&range=2d");
-        http.setTimeout(10000);
-        http.addHeader("User-Agent", "Mozilla/5.0");
-        code = http.GET();
-        if (code == 200) {
-            String payload = http.getString();
-            JsonDocument doc2;
-            if (!deserializeJson(doc2, payload)) {
-                float prevClose = doc2["chart"]["result"][0]["meta"]["chartPreviousClose"].as<float>();
-                if (prevClose > 0) {
-                    fxData.pct24h = (fxData.usdcny - prevClose) / prevClose * 100.0f;
-                    fxData.hasPct = true;
-                    Serial.printf("FX 24h: %+.3f%%\n", fxData.pct24h);
-                }
-            }
-        } else {
-            Serial.printf("FX Yahoo failed: %d\n", code);
-        }
-        http.end();
-    }
 }
 
 // ============================================================
@@ -544,56 +538,10 @@ void fetchGoldPrice()
 
     Serial.println("Fetching gold price...");
 
-    // 方案1: Yahoo Finance (实时)
-    http.begin(client, "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=1d&range=1d");
-    http.setTimeout(10000);
-    http.addHeader("User-Agent", "Mozilla/5.0");
-    int code = http.GET();
-    if (code == 200) {
-        String payload = http.getString();
-        JsonDocument doc;
-        if (!deserializeJson(doc, payload)) {
-            JsonObject meta = doc["chart"]["result"][0]["meta"];
-            float p = meta["regularMarketPrice"].as<float>();
-            float prevClose = meta["chartPreviousClose"].as<float>();
-            if (p > 100) {
-                goldData.priceUSD = p;
-                goldData.pct24h = (prevClose > 0) ? (p - prevClose) / prevClose * 100.0f : 0;
-                goldData.valid = true;
-                Serial.printf("Gold (Yahoo): $%.1f/oz (%+.2f%%)\n", p, goldData.pct24h);
-            }
-        }
-    } else {
-        Serial.printf("  Yahoo Finance failed: %d\n", code);
-    }
-    http.end();
-    if (goldData.valid) return;
-
-    // 方案2: OKX PAXG-USDT (实时，黄金代币，误差<1%)
-    http.begin(client, "https://www.okx.com/api/v5/market/ticker?instId=PAXG-USDT");
-    http.setTimeout(10000);
-    code = http.GET();
-    if (code == 200) {
-        String payload = http.getString();
-        JsonDocument doc;
-        if (!deserializeJson(doc, payload)) {
-            float p = doc["data"][0]["last"].as<float>();
-            if (p > 100) {
-                goldData.priceUSD = p;
-                goldData.valid = true;
-                Serial.printf("Gold (PAXG): $%.1f/oz\n", p);
-            }
-        }
-    } else {
-        Serial.printf("  OKX PAXG failed: %d\n", code);
-    }
-    http.end();
-    if (goldData.valid) return;
-
-    // 方案3: jsDelivr CDN (每日更新，可能有延迟)
+    // jsDelivr CDN
     http.begin(client, "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/xau.min.json");
     http.setTimeout(10000);
-    code = http.GET();
+    int code = http.GET();
     if (code == 200) {
         String payload = http.getString();
         JsonDocument doc;
@@ -787,6 +735,79 @@ void fetchCursorUsage()
 }
 
 // ============================================================
+// API: 股市指数 (Stooq CSV)
+// ============================================================
+
+void fetchOneIndex(WiFiClientSecure &client, int idx, const char* symbol)
+{
+    HTTPClient http;
+    char url[128];
+    snprintf(url, sizeof(url),
+             "https://stooq.com/q/l/?s=%%5e%s&f=sd2t2ohlcv&h&e=csv", symbol);
+    http.begin(client, url);
+    http.setTimeout(10000);
+    int code = http.GET();
+    if (code == 200) {
+        String payload = http.getString();
+        // CSV: header\nSymbol,Date,Time,Open,High,Low,Close,Volume
+        int nl = payload.indexOf('\n');
+        if (nl > 0) {
+            String dataLine = payload.substring(nl + 1);
+            dataLine.trim();
+            // parse CSV fields: Symbol,Date,Time,Open,High,Low,Close,Volume
+            float open_p = 0, close_p = 0;
+            int commaCount = 0;
+            int start = 0;
+            for (int i = 0; i <= (int)dataLine.length(); i++) {
+                if (i == (int)dataLine.length() || dataLine[i] == ',') {
+                    String field = dataLine.substring(start, i);
+                    if (commaCount == 3) open_p = field.toFloat();    // Open
+                    if (commaCount == 6) close_p = field.toFloat();   // Close
+                    start = i + 1;
+                    commaCount++;
+                }
+            }
+            if (close_p > 0 && open_p > 0) {
+                indexData.items[idx].price = close_p;
+                indexData.items[idx].pctChange = (close_p - open_p) / open_p * 100.0f;
+                indexData.items[idx].valid = true;
+            }
+        }
+    } else {
+        Serial.printf("  Stooq %s failed: %d\n", symbol, code);
+    }
+    http.end();
+}
+
+void fetchStockIndices()
+{
+    if (!wifiConnected) return;
+
+    WiFiClientSecure client;
+    client.setInsecure();
+
+    Serial.println("Fetching stock indices...");
+    const char* symbols[] = {"spx", "ndq", "dji", "shc"};
+    for (int i = 0; i < 4; i++) {
+        fetchOneIndex(client, i, symbols[i]);
+    }
+    indexData.valid = indexData.items[0].valid || indexData.items[3].valid;
+
+    if (indexData.valid) {
+        for (int i = 0; i < 4; i++) {
+            if (indexData.items[i].valid) {
+                Serial.printf("  %s: %.1f (%+.2f%%)\n",
+                              indexData.items[i].name,
+                              indexData.items[i].price,
+                              indexData.items[i].pctChange);
+            }
+        }
+    } else {
+        Serial.println("Stock indices: all failed");
+    }
+}
+
+// ============================================================
 // UI 布局 (648 x 480)
 //
 //  +--------------------------------------------+
@@ -833,7 +854,15 @@ void drawTimeArea()
 
     display.setFont(&FreeSans9pt7b);
     display.setCursor(14, 64);
-    display.print(wifiConnected ? "WiFi OK" : "WiFi --");
+    if (wifiConnected) {
+        char wifiBuf[48];
+        String ssid = WiFi.SSID();
+        int rssi = WiFi.RSSI();
+        snprintf(wifiBuf, sizeof(wifiBuf), "%s %ddBm", ssid.length() > 0 ? ssid.c_str() : "WiFi", rssi);
+        display.print(wifiBuf);
+    } else {
+        display.print("WiFi --");
+    }
 }
 
 // 趋势箭头 (cx,cy 为箭头中心, sz 为大小)
@@ -913,8 +942,8 @@ void drawLeftPanel()
 
     // AQI 显示 (天气区域下方)
     if (aqiData.valid) {
-        y += 28;
-        display.setFont(&FreeSans9pt7b);
+        y += 30;
+        display.setFont(&FreeSans12pt7b);
         const char* aqiLabel;
         if (aqiData.aqi <= 50)       aqiLabel = "Good";
         else if (aqiData.aqi <= 100) aqiLabel = "OK";
@@ -1025,25 +1054,39 @@ void drawLeftPanel()
     }
 }
 
-// --- Right Panel: 加密货币 + 黄金 + 汇率 ---
+// --- Right Panel: 统一字体，紧凑布局 ---
 void drawRightPanel()
 {
     int x = L::MID_DIV + 14;
-    int y = L::HDR_H + 28;
+    int y = L::HDR_H + 24;
     char buf[48];
-    int panelW = L::W - L::MID_DIV - 20;
+    int rightEdge = L::W - 16;
+    int priceX = x + 90;
+    int lineH = 28;
 
     display.setTextColor(GxEPD_BLACK);
+    display.setFont(&FreeSans12pt7b);
+
+    // helper lambda: 画一行 name price %change arrow
+    auto drawRow = [&](const char* name, const char* priceStr, float pct, bool hasPct) {
+        display.setCursor(x, y);
+        display.print(name);
+        display.setCursor(priceX, y);
+        display.print(priceStr);
+        if (hasPct) {
+            char pctBuf[16];
+            snprintf(pctBuf, sizeof(pctBuf), "%+.1f%%", pct);
+            int16_t tx2, ty2; uint16_t tw2, th2;
+            display.getTextBounds(pctBuf, 0, 0, &tx2, &ty2, &tw2, &th2);
+            display.setCursor(rightEdge - tw2 - 14, y);
+            display.print(pctBuf);
+            if (pct > 0.05f) drawArrowUp(rightEdge - 6, y - 5, 3);
+            else if (pct < -0.05f) drawArrowDown(rightEdge - 6, y - 5, 3);
+        }
+        y += lineH;
+    };
 
     // --- Crypto ---
-    display.setFont(&FreeSansBold12pt7b);
-    display.setCursor(x, y);
-    display.print("Crypto");
-    y += 10;
-    display.drawFastHLine(x, y, panelW, GxEPD_BLACK);
-
-    y += 30;
-    int rightEdge = L::W - 16;
     if (cryptoData.valid) {
         struct { const char* sym; float price; float pct; } coins[] = {
             {"BTC",  cryptoData.btc,  cryptoData.btcPct},
@@ -1051,126 +1094,95 @@ void drawRightPanel()
             {"SOL",  cryptoData.sol,  cryptoData.solPct},
             {"DOGE", cryptoData.doge, cryptoData.dogePct},
         };
-        int priceX = x + 82;
         for (auto &c : coins) {
-            display.setFont(&FreeSans12pt7b);
-            display.setCursor(x, y);
-            display.print(c.sym);
-
-            if (c.price >= 100000)
-                snprintf(buf, sizeof(buf), "$%.0f", c.price);
-            else if (c.price >= 1000)
-                snprintf(buf, sizeof(buf), "$%.1f", c.price);
-            else if (c.price >= 1)
-                snprintf(buf, sizeof(buf), "$%.2f", c.price);
-            else
-                snprintf(buf, sizeof(buf), "$%.4f", c.price);
-            display.setCursor(priceX, y);
-            display.print(buf);
-
-            // 24h 涨跌幅 (右对齐)
-            display.setFont(&FreeSans9pt7b);
-            char pctBuf[16];
-            snprintf(pctBuf, sizeof(pctBuf), "%+.1f%%", c.pct);
-            int16_t tx2, ty2; uint16_t tw2, th2;
-            display.getTextBounds(pctBuf, 0, 0, &tx2, &ty2, &tw2, &th2);
-            int pctX = rightEdge - tw2 - 14;
-            display.setCursor(pctX, y);
-            display.print(pctBuf);
-            // 小箭头
-            if (c.pct > 0.1f) drawArrowUp(rightEdge - 6, y - 6, 4);
-            else if (c.pct < -0.1f) drawArrowDown(rightEdge - 6, y - 6, 4);
-
-            y += 25;
+            if (c.price >= 100000)     snprintf(buf, sizeof(buf), "$%.0f", c.price);
+            else if (c.price >= 1000)  snprintf(buf, sizeof(buf), "$%.1f", c.price);
+            else if (c.price >= 1)     snprintf(buf, sizeof(buf), "$%.2f", c.price);
+            else                       snprintf(buf, sizeof(buf), "$%.4f", c.price);
+            drawRow(c.sym, buf, c.pct, true);
         }
     } else {
-        int priceX2 = x + 82;
-        display.setFont(&FreeSans12pt7b);
         const char* names[] = {"BTC", "ETH", "SOL", "DOGE"};
-        for (auto &n : names) {
-            display.setCursor(x, y);
-            display.print(n);
-            display.setCursor(priceX2, y);
-            display.print("------");
-            y += 25;
-        }
+        for (auto &n : names) { drawRow(n, "------", 0, false); }
     }
 
-    // --- Gold + FX ---
-    y += 10;
-    display.drawFastHLine(x, y, panelW, GxEPD_BLACK);
-    y += 26;
-    display.setFont(&FreeSansBold12pt7b);
-    display.setCursor(x, y);
-    display.print("Gold / FX");
-    y += 10;
-    display.drawFastHLine(x, y, panelW, GxEPD_BLACK);
+    // --- F&G (紧接 DOGE 下方) ---
+    if (fgData.valid) {
+        snprintf(buf, sizeof(buf), "%d", fgData.value);
+        display.setCursor(x, y);
+        display.print("F&G");
+        display.setCursor(priceX, y);
+        display.print(buf);
+        int16_t tx2, ty2; uint16_t tw2, th2;
+        display.getTextBounds(fgData.label, 0, 0, &tx2, &ty2, &tw2, &th2);
+        display.setCursor(rightEdge - tw2 - 4, y);
+        display.print(fgData.label);
+        y += lineH + 6;
+    }
 
-    int gfxPriceX = x + 82;
-    y += 30;
-    // 金价 + 24h 涨跌
-    display.setFont(&FreeSans12pt7b);
-    display.setCursor(x, y);
-    display.print("Gold");
+    // --- Gold ---
     if (goldData.valid) {
         snprintf(buf, sizeof(buf), "$%.0f", goldData.priceUSD);
-        display.setCursor(gfxPriceX, y);
-        display.print(buf);
-
-        display.setFont(&FreeSans9pt7b);
-        char pctBuf[16];
-        snprintf(pctBuf, sizeof(pctBuf), "%+.2f%%", goldData.pct24h);
-        int16_t tx2, ty2; uint16_t tw2, th2;
-        display.getTextBounds(pctBuf, 0, 0, &tx2, &ty2, &tw2, &th2);
-        display.setCursor(rightEdge - tw2 - 14, y);
-        display.print(pctBuf);
-        if (goldData.pct24h > 0.01f) drawArrowUp(rightEdge - 6, y - 6, 4);
-        else if (goldData.pct24h < -0.01f) drawArrowDown(rightEdge - 6, y - 6, 4);
+        drawRow("Gold", buf, goldData.pct24h, true);
     } else {
-        display.setCursor(gfxPriceX, y);
-        display.print("------");
+        drawRow("Gold", "------", 0, false);
     }
 
-    y += 26;
-    // 汇率 + 24h 涨跌
-    display.setFont(&FreeSans12pt7b);
-    display.setCursor(x, y);
-    display.print("CNY");
-    if (fxData.valid) {
-        snprintf(buf, sizeof(buf), "%.4f", fxData.usdcny);
-        display.setCursor(gfxPriceX, y);
-        display.print(buf);
+    // --- USD/CNY (手动绘制 ¥ 符号) ---
+    {
+        display.setCursor(x, y);
+        display.print("$/");
+        int16_t tx1, ty1; uint16_t tw1, th1;
+        display.getTextBounds("$/", 0, 0, &tx1, &ty1, &tw1, &th1);
+        int yenX = x + tw1 + 2;
+        int yenW = 14, yenH = 16;
+        int yenTop = y - yenH;
+        int yenMid = y - yenH / 2;
+        for (int d = 0; d <= 1; d++) {
+            display.drawLine(yenX + d, yenTop, yenX + yenW / 2 + d, yenMid, GxEPD_BLACK);
+            display.drawLine(yenX + yenW + d, yenTop, yenX + yenW / 2 + d, yenMid, GxEPD_BLACK);
+            display.drawLine(yenX + yenW / 2 + d, yenMid, yenX + yenW / 2 + d, y, GxEPD_BLACK);
+        }
+        display.drawFastHLine(yenX + 2, yenMid + 2, yenW - 4, GxEPD_BLACK);
+        display.drawFastHLine(yenX + 2, yenMid + 3, yenW - 4, GxEPD_BLACK);
+        display.drawFastHLine(yenX + 2, yenMid + 6, yenW - 4, GxEPD_BLACK);
+        display.drawFastHLine(yenX + 2, yenMid + 7, yenW - 4, GxEPD_BLACK);
 
+        if (fxData.valid) {
+            snprintf(buf, sizeof(buf), "%.4f", fxData.usdcny);
+        } else {
+            snprintf(buf, sizeof(buf), "------");
+        }
+        display.setCursor(priceX, y);
+        display.print(buf);
         if (fxData.hasPct) {
-            display.setFont(&FreeSans9pt7b);
             char pctBuf[16];
-            snprintf(pctBuf, sizeof(pctBuf), "%+.2f%%", fxData.pct24h);
+            snprintf(pctBuf, sizeof(pctBuf), "%+.1f%%", fxData.pct24h);
             int16_t tx2, ty2; uint16_t tw2, th2;
             display.getTextBounds(pctBuf, 0, 0, &tx2, &ty2, &tw2, &th2);
             display.setCursor(rightEdge - tw2 - 14, y);
             display.print(pctBuf);
-            if (fxData.pct24h > 0.01f) drawArrowUp(rightEdge - 6, y - 6, 4);
-            else if (fxData.pct24h < -0.01f) drawArrowDown(rightEdge - 6, y - 6, 4);
+            if (fxData.pct24h > 0.05f) drawArrowUp(rightEdge - 6, y - 5, 3);
+            else if (fxData.pct24h < -0.05f) drawArrowDown(rightEdge - 6, y - 5, 3);
         }
-    } else {
-        display.setCursor(gfxPriceX, y);
-        display.print("------");
+        y += lineH;
     }
+    y += 6;
 
-    // 恐惧贪婪指数（数字加粗）
-    if (fgData.valid) {
-        y += 14;
-        display.drawFastHLine(x, y, panelW, GxEPD_BLACK);
-        y += 22;
-        display.setFont(&FreeSansBold12pt7b);
-        snprintf(buf, sizeof(buf), "F&G %d", fgData.value);
-        display.setCursor(x, y);
-        display.print(buf);
-        int16_t tx2, ty2; uint16_t tw2, th2;
-        display.getTextBounds(buf, x, y, &tx2, &ty2, &tw2, &th2);
-        display.setFont(&FreeSans9pt7b);
-        display.setCursor(x + tw2 + 6, y);
-        display.print(fgData.label);
+    // --- 股指 ---
+    if (indexData.valid) {
+        for (int i = 0; i < 4; i++) {
+            auto &item = indexData.items[i];
+            if (item.valid) {
+                if (item.price >= 10000)
+                    snprintf(buf, sizeof(buf), "%.0f", item.price);
+                else
+                    snprintf(buf, sizeof(buf), "%.1f", item.price);
+                drawRow(item.name, buf, item.pctChange, true);
+            } else {
+                drawRow(item.name, "------", 0, false);
+            }
+        }
     }
 }
 
@@ -1342,6 +1354,7 @@ void setup()
         fetchFearGreed();
         fetchAqi();
         fetchCursorUsage();
+        fetchStockIndices();
     }
 
     readSensor();
@@ -1360,6 +1373,7 @@ void setup()
     lastFgFetch      = t;
     lastAqiFetch     = t;
     lastCursorFetch  = t;
+    lastIndexFetch   = t;
 
     Serial.println("Phase 6 ready.");
 }
@@ -1503,6 +1517,15 @@ void loop()
         ensureWiFi();
         fetchCursorUsage();
         lastCursorFetch = now;
+    }
+
+    // 每 10 分钟：获取股指
+    if (now - lastIndexFetch >= INDEX_FETCH_INTERVAL) {
+        ensureWiFi();
+        fetchStockIndices();
+        display.init(115200, false, 50, false);
+        drawRightPartial();
+        lastIndexFetch = now;
     }
 
     // 每 30 分钟：全屏刷新（防残影）

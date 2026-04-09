@@ -50,6 +50,7 @@
 #define FG_FETCH_INTERVAL         600000   // 恐惧贪婪: 10 分钟
 #define AQI_FETCH_INTERVAL        600000   // AQI: 10 分钟
 #define CURSOR_FETCH_INTERVAL     300000   // Cursor: 5 分钟
+#define INDEX_FETCH_INTERVAL      600000   // 股指: 10 分钟
 #define FULL_REFRESH_INTERVAL     1800000  // 全刷新: 30 分钟
 
 // --- LD2402 雷达传感器 (UART) ---
