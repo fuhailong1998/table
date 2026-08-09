@@ -8,16 +8,15 @@
 |------|--------|----------|
 | 时间日期 | NTP 同步 | 1 分钟 |
 | 温湿度/气压 | BME280 传感器 | 2 分钟 |
-| BTC/ETH/SOL/DOGE 价格 + 24h 涨跌 | CryptoCompare / Binance / CoinGecko | 2 分钟 |
-| 黄金现货价格 | jsDelivr CDN (currency-api) | 10 分钟 |
+| BTC/ETH/SOL/DOGE 价格（主/备源含 24h 涨跌） | Binance Vision / CoinGecko / jsDelivr 兜底 | 2 分钟 |
+| 黄金现货价格 | open.er-api XAU / jsDelivr 兜底 | 10 分钟 |
 | USD/CNY 汇率 | open.er-api.com | 10 分钟 |
-| 股指 (S&P500/纳斯达克/道琼斯/上证) | Stooq.com | 10 分钟 |
+| 股指 (S&P500/纳斯达克/道琼斯/上证) | 腾讯行情 | 10 分钟 |
 | 天气预报（今天/明天） | Open-Meteo | 10 分钟 |
 | 恐惧贪婪指数 | alternative.me | 10 分钟 |
 | 空气质量 AQI | Open-Meteo | 10 分钟 |
-| Cursor IDE 用量 | Cursor API | 5 分钟 |
 | 人体存在检测 + 工位占用统计 | LD2402 毫米波雷达 | 实时 |
-| Wi-Fi 名称 + 信号强度 | ESP32 WiFi | 1 分钟 |
+| Wi-Fi 连接状态 + 信号格 | ESP32 WiFi | 1 分钟 |
 
 ### 离开模式
 
@@ -61,9 +60,7 @@ pip install platformio
 cp firmware/src/secrets.h.example firmware/src/secrets.h
 ```
 
-编辑 `firmware/src/secrets.h`，填入：
-- WiFi SSID 和密码
-- Cursor 的 `WorkosCursorSessionToken` cookie（从浏览器 DevTools 获取）
+编辑 `firmware/src/secrets.h`，填入 WiFi SSID 和密码。
 
 ### 3. 编译烧录
 
@@ -94,7 +91,7 @@ firmware/
 ├── platformio.ini          # PlatformIO 配置
 └── src/
     ├── config.h            # 硬件引脚、API、刷新间隔配置
-    ├── secrets.h           # WiFi 和 Cookie（不提交到 git）
+    ├── secrets.h           # WiFi 凭证（不提交到 git）
     ├── secrets.h.example   # secrets.h 模板
     └── main.cpp            # 主程序
 docs/

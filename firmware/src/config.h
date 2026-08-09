@@ -31,8 +31,17 @@
 // --- API 端点 ---
 #define EXCHANGE_API  "https://open.er-api.com/v6/latest/USD"
 
-// --- Cursor Usage ---
-#define CURSOR_USAGE_URL "https://cursor.com/api/usage-summary"
+#define CRYPTO_BINANCE_API \
+    "https://data-api.binance.vision/api/v3/ticker/24hr?" \
+    "symbols=%5B%22BTCUSDT%22,%22ETHUSDT%22,%22SOLUSDT%22,%22DOGEUSDT%22%5D&type=MINI"
+#define CRYPTO_COINGECKO_API \
+    "https://api.coingecko.com/api/v3/simple/price?" \
+    "ids=bitcoin,ethereum,solana,dogecoin&vs_currencies=usd&include_24hr_change=true"
+#define CRYPTO_CDN_API \
+    "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.min.json"
+
+#define STOCK_INDEX_API \
+    "https://qt.gtimg.cn/q=s_usINX,s_usIXIC,s_usDJI,s_sh000001"
 
 // --- 天气配置（沈阳浑南区）---
 #define WEATHER_LAT   "41.72"
@@ -49,7 +58,6 @@
 #define WEATHER_FETCH_INTERVAL    600000   // 天气: 10 分钟
 #define FG_FETCH_INTERVAL         600000   // 恐惧贪婪: 10 分钟
 #define AQI_FETCH_INTERVAL        600000   // AQI: 10 分钟
-#define CURSOR_FETCH_INTERVAL     300000   // Cursor: 5 分钟
 #define INDEX_FETCH_INTERVAL      600000   // 股指: 10 分钟
 #define FULL_REFRESH_INTERVAL     1800000  // 全刷新: 30 分钟
 
